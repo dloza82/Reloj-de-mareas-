@@ -2,7 +2,7 @@
   "name": "Reloj de Mareas · Gijón",
   "short_name": "Reloj de Mareas",
   "description": "Mareas en tiempo real de la Playa de San Lorenzo, Gijón",
-  "start_url": "/",
+  "start_url": "/Reloj-de-mareas-/",
   "display": "fullscreen",
   "background_color": "#0a0a0a",
   "theme_color": "#0a0a0a",
