@@ -111,81 +111,50 @@ let waveHeightFt = 3;
 let wavePeriodMs = 3000;
 
 function fetchMarineData() {
-  fetchTides();
-  fetchWaves();
+  fetchTides();  // async via fetch promise
+  fetchWaves();  // async via fetch promise
 }
 
 function fetchTides() {
-  try {
-    const now = Date.now() / 1000;
-    const ref = new Date('2024-01-01T00:00:00Z').getTime() / 1000;
-    const dt  = now - ref;
+  // Leer mareas oficiales del IHM desde mareas.json
+  // (actualizado cada día automáticamente por GitHub Actions)
+  fetch('mareas.json?t=' + Date.now())
+    .then(r => r.json())
+    .then(data => {
+      if (!data.extremes || data.extremes.length < 2) { fallbackTide(); return; }
 
-    // Constituyentes armónicas para Gijón
-    // Fases calculadas para coincidir con datos IHM:
-    // Bajamar 22/03/2026 12:25h local (11:25 UTC)
-    // Pleamar 22/03/2026 18:37h local (17:37 UTC)
-    const M2 = 2*Math.PI / (12.4206 * 3600);
-    const S2 = 2*Math.PI / (12.0000 * 3600);
-    const N2 = 2*Math.PI / (12.6584 * 3600);
-    const K1 = 2*Math.PI / (23.9345 * 3600);
-    const O1 = 2*Math.PI / (25.8194 * 3600);
+      const nowMs = Date.now();
 
-    // Fases calibradas. El modelo produce un mínimo en dt correspondiente a 11:25 UTC del 22/03/2026
-    // dt_bajamar = (1742639100 - ref) donde 1742639100 = Unix de 2026-03-22T11:25:00Z
-    const dt_low = 1774178700 - ref; // bajamar 22/03/2026 12:25h CET (11:25 UTC)
-    // Calcular fases para que h(dt_low) sea mínimo:
-    // fase_M2 = π - M2*dt_low  (para que cos sea -1 en ese punto)
-    const ph_M2 = Math.PI - M2 * dt_low;
-    const ph_S2 = Math.PI - S2 * dt_low;
-    const ph_N2 = Math.PI - N2 * dt_low;
-    const ph_K1 = Math.PI - K1 * dt_low;
-    const ph_O1 = Math.PI - O1 * dt_low;
+      // Convertir fechas a timestamps — la API del IHM devuelve hora local CET/CEST
+      const extremes = data.extremes.map(e => {
+        // Detectar si estamos en horario de verano (CEST = UTC+2) o invierno (CET = UTC+1)
+        const d = new Date();
+        const jan = new Date(d.getFullYear(), 0, 1).getTimezoneOffset();
+        const jul = new Date(d.getFullYear(), 6, 1).getTimezoneOffset();
+        const isDST = d.getTimezoneOffset() < Math.max(jan, jul);
+        const offset = isDST ? '+02:00' : '+01:00';
+        return {
+          ts:   new Date(e.fecha.replace(' ', 'T') + offset).getTime(),
+          type: e.tipo
+        };
+      });
 
-    function h(t) {
-      return 1.95 * Math.cos(M2*t + ph_M2)
-           + 0.68 * Math.cos(S2*t + ph_S2)
-           + 0.38 * Math.cos(N2*t + ph_N2)
-           + 0.12 * Math.cos(K1*t + ph_K1)
-           + 0.08 * Math.cos(O1*t + ph_O1);
-    }
+      const past   = extremes.filter(e => e.ts <= nowMs);
+      const future = extremes.filter(e => e.ts >  nowMs);
 
-    // Dirección: comparar nivel actual con el de 1h adelante
-    const rising = h(dt + 3600) > h(dt);
+      if (!past.length || !future.length) { fallbackTide(); return; }
 
-    // Buscar extremo anterior (hasta 8h atrás, cada 5 min)
-    let prevExtremeTs = null;
-    for (let s = 300; s <= 8*3600; s += 300) {
-      const hh = h(dt - s);
-      const hb = h(dt - s - 300);
-      const ha = h(dt - s + 300);
-      const isPrev = rising ? (hh < hb && hh < ha) : (hh > hb && hh > ha);
-      if (isPrev) { prevExtremeTs = (now - s) * 1000; break; }
-    }
+      const lastTide   = past[past.length - 1];
+      const nextTide   = future[0];
+      const rising     = nextTide.type === 'High';
+      const elapsed    = nowMs - lastTide.ts;
+      const cycleTotal = nextTide.ts - lastTide.ts;
+      const frac       = Math.max(0, Math.min(1, elapsed / cycleTotal));
+      const litCount   = Math.round((1 - frac) * 64);
 
-    // Buscar próximo extremo (hasta 8h adelante, cada 5 min)
-    let nextExtremeTs = null;
-    for (let s = 300; s <= 8*3600; s += 300) {
-      const hh = h(dt + s);
-      const hb = h(dt + s - 300);
-      const ha = h(dt + s + 300);
-      const isNext = rising ? (hh > hb && hh > ha) : (hh < hb && hh < ha);
-      if (isNext) { nextExtremeTs = (now + s) * 1000; break; }
-    }
-
-    if (!prevExtremeTs || !nextExtremeTs) { fallbackTide(); return; }
-
-    const nowMs      = Date.now();
-    const elapsed    = nowMs - prevExtremeTs;
-    const cycleTotal = nextExtremeTs - prevExtremeTs;
-    const frac       = Math.max(0, Math.min(1, elapsed / cycleTotal));
-    const litCount   = Math.round((1 - frac) * 64);
-
-    tideState = { litCount, rising, lastTs: prevExtremeTs, cycleTotal };
-
-  } catch(e) {
-    fallbackTide();
-  }
+      tideState = { litCount, rising, lastTs: lastTide.ts, cycleTotal };
+    })
+    .catch(() => fallbackTide());
 }
 
 async function fetchWaves() {
