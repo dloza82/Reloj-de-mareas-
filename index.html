@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=0.5, maximum-scale=4.0">
+<meta name="theme-color" content="#0a0a0a" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#0a0a0a">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="apple-mobile-web-app-title" content="Reloj de Mareas">
+<title>Reloj de Mareas · Gijón</title>
+<link rel="manifest" href="manifest.json">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    width: 100%; height: 100%;
+    overflow: hidden;
+    background: #0a0a0a;
+    position: fixed;
+    top: 0; left: 0;
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
+  }
+  body {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  canvas { display: block; position: fixed; top: 0; left: 0; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="dbg" style="position:fixed;top:8px;left:8px;background:rgba(0,0,0,0.85);color:#0f0;font:10px monospace;padding:8px;border-radius:6px;z-index:999;line-height:1.8">Init...</div>
+<script>
+
+const COLS = 8, ROWS = 8, TOTAL = COLS * ROWS;
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+// Dimensiones calculadas dinámicamente según la pantalla
+let SIZE, GAP, LIFT, PAD, W, H;
+
+function resize() {
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+
+  // Calcular el tamaño de celda que llena la pantalla
+  // dejando un pequeño margen
+  const margin = Math.min(vw, vh) * 0.04;
+  const cellW  = (vw - margin * 2) / COLS;
+  const cellH  = (vh - margin * 2) / (ROWS + 0.5); // +0.5 para el LIFT
+
+  SIZE = Math.floor(Math.min(cellW, cellH));
+  GAP  = Math.max(2, Math.round(SIZE * 0.08));
+  LIFT = Math.round(SIZE * 0.25);
+  PAD  = margin;
+
+  // Recalcular tamaño real considerando gaps
+  SIZE = Math.floor((vw - PAD * 2 - (COLS - 1) * GAP) / COLS);
+  LIFT = Math.round(SIZE * 0.25);
+
+  W = vw;
+  H = vh;
+
+  canvas.width  = W;
+  canvas.height = H;
+  canvas.style.width  = W + 'px';
+  canvas.style.height = H + 'px';
+}
+
+resize();
+
+function handleResize() {
+  resize();
+}
+
+window.addEventListener('resize', handleResize);
+window.addEventListener('orientationchange', () => {
+  setTimeout(handleResize, 100); // pequeño delay para que el navegador actualice las dimensiones
+});
+
+// ── Secuencia de colores ──────────────────────────────
+const PALETTES = [
+  { on: [25,  70,  140], off: [155, 205, 235], flash: [230, 248, 255] }, // Azul original
+  { on: [78,  185, 170], off: [180, 220, 210], flash: [230, 250, 245] }, // Verdes marinos
+  { on: [162,  90, 180], off: [210, 170, 220], flash: [240, 225, 245] }, // 2562 abajo / 256 arriba
+  { on: [245, 185, 175], off: [250, 220, 210], flash: [255, 245, 240] }, // 711 abajo / 709 arriba
+  { on: [235, 220,  50], off: [245, 240, 155], flash: [255, 252, 220] }, // 3955 abajo / 393 arriba
+  { on: [210,  95, 155], off: [245, 190, 215], flash: [255, 235, 245] }, // 239 abajo / 2365 arriba
+  { on: [155, 145, 135], off: [200, 195, 190], flash: [235, 232, 230] }, // CG4 abajo / CG2 arriba
+  { on: [200, 195, 190], off: [225, 222, 218], flash: [245, 243, 241] }, // CG2 abajo / CG1 arriba
+];
+let paletteIndex = 0;
+
+canvas.style.cursor = 'pointer';
+canvas.addEventListener('click', () => {
+  paletteIndex = (paletteIndex + 1) % PALETTES.length;
+});
+
+function getColors() { return PALETTES[paletteIndex]; }
+
+// ── Datos de marea — Open-Meteo Marine ───────────────
+const OM_LAT = 43.545, OM_LON = -5.668;
+const SG_KEY = '465b185a-2b64-11f1-a882-0242ac120004-465b18c8-2b64-11f1-a882-0242ac120004';
+const CACHE_KEY = 'sg_tides_cache_v2';
+const CACHE_TTL = 8 * 60 * 60 * 1000;
+
+// Limpiar cachés antiguas
+try {
+  localStorage.removeItem('sg_tides_cache');
+  localStorage.removeItem('sg_tides_cache_v1');
+} catch(e) {}
+
+let tideState    = { litCount: 32, rising: true };
+let waveHeightFt = 3;
+let wavePeriodMs = 3000;
+
+function fetchMarineData() {
+  fetchTides();
+  fetchWaves();
+}
+
+function fetchTides() {
+  // Caché deshabilitada temporalmente para debug
+  // try {
+  //   const cached = localStorage.getItem(CACHE_KEY);
+  //   if (cached) {
+  //     const { ts, extremes } = JSON.parse(cached);
+  //     if (Date.now() - ts < CACHE_TTL) {
+  //       processTideExtremes(extremes);
+  //       return;
+  //     }
+  //   }
+  // } catch(e) {}
+
+  const now   = new Date();
+  const start = Math.floor(now.getTime() / 1000);
+  const end   = start + 3 * 24 * 3600;
+
+  fetch(`https://api.stormglass.io/v2/tide/extremes/point?lat=${OM_LAT}&lng=${OM_LON}&start=${start}&end=${end}`, {
+    headers: { 'Authorization': SG_KEY }
+  })
+  .then(r => r.json())
+  .then(data => {
+    const dbg = document.getElementById('dbg');
+    if (!data.data || data.data.length < 2) {
+      if (dbg) dbg.innerHTML = `SG sin datos: ${JSON.stringify(data).slice(0,80)}`;
+      fallbackTide(); return;
+    }
+    const extremes = data.data.map(e => ({
+      ts:   new Date(e.time).getTime(),
+      type: e.type === 'high' ? 'High' : 'Low'
+    }));
+    try {
+      localStorage.setItem(CACHE_KEY, JSON.stringify({ ts: Date.now(), extremes }));
+    } catch(e) {}
+    processTideExtremes(extremes);
+  })
+  .catch(e => {
+    const dbg = document.getElementById('dbg');
+    if (dbg) dbg.innerHTML = `SG error: ${e.message}`;
+    fallbackTide();
+  });
+}
+
+function processTideExtremes(extremes) {
+  const nowMs  = Date.now();
+  const past   = extremes.filter(e => e.ts <= nowMs);
+  const future = extremes.filter(e => e.ts >  nowMs);
+
+  if (!past.length || !future.length) { fallbackTide(); return; }
+
+  const lastTide   = past[past.length - 1];
+  const nextTide   = future[0];
+  const rising     = nextTide.type === 'High';
+  const elapsed    = nowMs - lastTide.ts;
+  const cycleTotal = nextTide.ts - lastTide.ts;
+  const frac       = Math.max(0, Math.min(1, elapsed / cycleTotal));
+  const litCount   = Math.round(frac * 64);
+
+  tideState = { litCount, rising, lastTs: lastTide.ts, cycleTotal };
+
+  // Debug temporal
+  const dbg = document.getElementById('dbg');
+  if (dbg) {
+    const lastTime = new Date(lastTide.ts).toLocaleTimeString('es-ES', {hour:'2-digit',minute:'2-digit'});
+    const nextTime = new Date(nextTide.ts).toLocaleTimeString('es-ES', {hour:'2-digit',minute:'2-digit'});
+    const minLeft  = Math.round((nextTide.ts - nowMs) / 60000);
+    dbg.innerHTML = `↑:${rising}<br>Última:${lastTide.type} ${lastTime}<br>Próxima:${nextTide.type} ${nextTime}<br>Faltan:${minLeft}min<br>frac:${frac.toFixed(2)}<br>Píx:${litCount}/64`;
+  }
+}
+
+async function fetchWaves() {
+  try {
+    const url  = `https://marine-api.open-meteo.com/v1/marine?latitude=${OM_LAT}&longitude=${OM_LON}&hourly=wave_height,wave_period&timezone=Europe%2FMadrid&forecast_days=1`;
+    const res  = await fetch(url);
+    const data = await res.json();
+    const hour = new Date().getHours();
+    const h    = data.hourly.wave_height[hour];
+    const p    = data.hourly.wave_period[hour];
+    if (h) waveHeightFt = h * 3.281;
+    if (p) wavePeriodMs = p * 1000;
+  } catch(e) {}
+}
+
+function fallbackTide() {
+  const now   = Date.now();
+  const CYCLE = 6 * 3600 * 1000 + 12 * 60 * 1000;
+  const phase = (now % CYCLE) / CYCLE;
+  tideState = {
+    litCount: Math.round((1 - (phase < 0.5 ? phase * 2 : (phase - 0.5) * 2)) * 64),
+    rising:   phase < 0.5
+  };
+}
+
+// ── Orden ola ─────────────────────────────────────────
+function buildScanOrder() {
+  const order = [];
+  for (let row = ROWS-1; row >= 0; row--)
+    for (let col = 0; col < COLS; col++)
+      order.push(row * COLS + col);
+  return order;
+}
+const ORDER_UP   = buildScanOrder();
+const ORDER_DOWN = [...ORDER_UP].reverse();
+
+function lerp3(a, b, t) {
+  t = Math.max(0, Math.min(1, t));
+  return [
+    Math.round(a[0]+(b[0]-a[0])*t),
+    Math.round(a[1]+(b[1]-a[1])*t),
+    Math.round(a[2]+(b[2]-a[2])*t),
+  ];
+}
+
+// ── Dibujar píxel Tidey ───────────────────────────────
+// Col par:   derecha sube LIFT  (TL más abajo, TR más arriba)
+// Col impar: izquierda sube LIFT (espejo)
+// Los píxeles encajan perfectamente entre sí sin huecos.
+
+function drawPixel(row, col, color) {
+  // Centrar la cuadrícula en la pantalla
+  const gridW = COLS * SIZE + (COLS - 1) * GAP;
+  const gridH = ROWS * SIZE + (ROWS - 1) * GAP + LIFT;
+  const offsetX = (W - gridW) / 2;
+  const offsetY = (H - gridH) / 2;
+
+  const x = offsetX + col * (SIZE + GAP);
+  const y = offsetY + row * (SIZE + GAP);
+  const [r,g,b] = color;
+
+  ctx.fillStyle = `rgb(${r},${g},${b})`;
+  ctx.strokeStyle = 'rgba(0,0,0,0.4)';
+  ctx.lineWidth = 1.5;
+
+  ctx.beginPath();
+  if (col % 2 === 0) {
+    // Par: derecha sube
+    ctx.moveTo(x,        y + LIFT);
+    ctx.lineTo(x + SIZE, y);
+    ctx.lineTo(x + SIZE, y + SIZE);
+    ctx.lineTo(x,        y + SIZE + LIFT);
+  } else {
+    // Impar: izquierda sube
+    ctx.moveTo(x,        y);
+    ctx.lineTo(x + SIZE, y + LIFT);
+    ctx.lineTo(x + SIZE, y + SIZE + LIFT);
+    ctx.lineTo(x,        y + SIZE);
+  }
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+}
+
+// ── Draw ──────────────────────────────────────────────
+function draw(litCount, rising, wavePos) {
+  ctx.clearRect(0, 0, W, H);
+
+  const litSet = new Set(ORDER_UP.slice(0, litCount));
+  const order  = rising ? ORDER_UP : ORDER_DOWN;
+
+  // La ola recorre los 64 píxeles en un ciclo
+  // wavePos 0..1 → posición de la cabeza de la ola (0..63)
+  const headI = wavePos * (TOTAL - 1);
+
+  // Longitud del flash = altura ola en pies (1 pie = 1 píxel)
+  const WAVE_LEN = Math.max(1, Math.min(8, Math.round(waveHeightFt)));
+
+  for (let row = 0; row < ROWS; row++) {
+    for (let col = 0; col < COLS; col++) {
+      const idx  = row * COLS + col;
+      const isOn = litSet.has(idx);
+      const { on, off, flash: flashColor } = getColors();
+      const base = isOn ? on : off;
+
+      const waveI = order.indexOf(idx);
+      const dist  = headI - waveI;
+      let flash = 0;
+      if (dist >= 0 && dist <= WAVE_LEN)
+        flash = Math.pow(1 - dist / WAVE_LEN, 2);
+
+      const color = lerp3(base, flashColor, flash * 0.95);
+
+      if (flash > 0.1) {
+        ctx.shadowColor = `rgba(200,240,255,${flash*0.5})`;
+        ctx.shadowBlur  = 14 * flash;
+      } else {
+        ctx.shadowBlur = 0;
+      }
+
+      drawPixel(row, col, color);
+    }
+  }
+  ctx.shadowBlur = 0;
+}
+
+// ── Pantalla completa ─────────────────────────────────
+function goFullscreen() {
+  const el = document.documentElement;
+  if (el.requestFullscreen) el.requestFullscreen();
+  else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+}
+document.addEventListener('click', goFullscreen, { once: false });
+goFullscreen();
+// ── Eliminar service workers y caché ─────────────────
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.getRegistrations().then(regs => {
+    regs.forEach(reg => reg.unregister());
+  });
+  caches.keys().then(keys => keys.forEach(k => caches.delete(k)));
+}
+
+// ── Loop ──────────────────────────────────────────────
+fetchMarineData();
+setInterval(fetchMarineData, 60 * 60 * 1000); // recargar cada hora
+
+// Interpolar litCount cada minuto sin recargar la API
+setInterval(() => {
+  if (tideState.lastTs && tideState.cycleTotal) {
+    const elapsed     = Date.now() - tideState.lastTs;
+    const fracElapsed = Math.max(0, Math.min(1, elapsed / tideState.cycleTotal));
+    tideState.litCount = Math.round(fracElapsed * 64);
+  }
+}, 60 * 1000);
+
+function loop(ts) {
+  const wavePos = (ts % wavePeriodMs) / wavePeriodMs;
+  draw(Math.round(tideState.litCount), tideState.rising, wavePos);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
