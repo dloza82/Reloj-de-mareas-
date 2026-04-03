@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=0.5, maximum-scale=4.0">
+<meta name="theme-color" content="#0a0a0a" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#0a0a0a">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="apple-mobile-web-app-title" content="Reloj de Mareas">
+<title>Reloj de Mareas · Gijón</title>
+<link rel="manifest" href="manifest.json">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    width: 100%; height: 100%;
+    overflow: hidden;
+    background: #0a0a0a;
+    position: fixed;
+    top: 0; left: 0;
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
+  }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; position: fixed; top: 0; left: 0; }
+  #dbg {
+    position: fixed;
+    bottom: 8px; left: 0; right: 0;
+    text-align: center;
+    font-family: monospace;
+    font-size: 11px;
+    color: rgba(255,255,255,0.55);
+    pointer-events: none;
+    z-index: 10;
+    line-height: 1.6;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="dbg"></div>
+<script>
+
+const COLS = 8, ROWS = 8, TOTAL = COLS * ROWS;
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+const dbgEl  = document.getElementById('dbg');
+
+// ── Dimensiones ───────────────────────────────────────
+let SIZE, GAP, LIFT, PAD, W, H;
+function resize() {
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const margin = Math.min(vw, vh) * 0.04;
+  SIZE = Math.floor(Math.min((vw - margin*2)/COLS, (vh - margin*2)/(ROWS+0.5)));
+  GAP  = Math.max(2, Math.round(SIZE * 0.08));
+  SIZE = Math.floor((vw - margin*2 - (COLS-1)*GAP) / COLS);
+  LIFT = Math.round(SIZE * 0.25);
+  PAD  = margin; W = vw; H = vh;
+  canvas.width = W; canvas.height = H;
+  canvas.style.width = W+'px'; canvas.style.height = H+'px';
+}
+resize();
+window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', () => setTimeout(resize, 100));
+
+// ── Paletas ───────────────────────────────────────────
+const PALETTES = [
+  { on: [25,  70,  140], off: [155, 205, 235], flash: [230, 248, 255] },
+  { on: [78,  185, 170], off: [180, 220, 210], flash: [230, 250, 245] },
+  { on: [162,  90, 180], off: [210, 170, 220], flash: [240, 225, 245] },
+  { on: [245, 185, 175], off: [250, 220, 210], flash: [255, 245, 240] },
+  { on: [235, 220,  50], off: [245, 240, 155], flash: [255, 252, 220] },
+  { on: [210,  95, 155], off: [245, 190, 215], flash: [255, 235, 245] },
+  { on: [155, 145, 135], off: [200, 195, 190], flash: [235, 232, 230] },
+  { on: [200, 195, 190], off: [225, 222, 218], flash: [245, 243, 241] },
+];
+let paletteIndex = 0;
+canvas.style.cursor = 'pointer';
+canvas.addEventListener('click', () => { paletteIndex = (paletteIndex+1) % PALETTES.length; });
+function getColors() { return PALETTES[paletteIndex]; }
+
+// ── Estado ────────────────────────────────────────────
+let tideData     = null;   // { lastTs, cycleTotal, rising, source }
+let waveHeightFt = 3;
+let wavePeriodMs = 3000;
+
+function computeLitCount() {
+  if (!tideData) return 32;
+  const frac = Math.max(0, Math.min(1, (Date.now() - tideData.lastTs) / tideData.cycleTotal));
+  return tideData.rising ? Math.round(frac * 64) : Math.round((1 - frac) * 64);
+}
+
+// ── Constantes ────────────────────────────────────────
+const LAT = 43.545, LON = -5.668;
+const IHM_PORT = 'gijon';   // nombre corto del puerto en la API IHM
+
+// Cachés separadas por fuente
+const CACHE_IHM = 'ihm_v1';
+const CACHE_OM  = 'om_v1';
+const CACHE_TTL = 6 * 60 * 60 * 1000;
+
+// Limpiar cachés antiguas
+try {
+  ['sg_tides_cache','sg_tides_cache_v1','sg_tides_cache_v2','sg_tides_cache_v3',
+   'om_tides_v1','om_tides_v2','om_tides_v3','om_tides_v4']
+    .forEach(k => localStorage.removeItem(k));
+} catch(e) {}
+
+// ── Fuente 1: IHM oficial ─────────────────────────────
+// La API del IHM (ideihm.covam.es) es HTTP puro — no accesible desde HTTPS.
+// Usamos allorigins.win como proxy CORS para accederla desde GitHub Pages.
+async function fetchTidesIHM() {
+  // Intentar caché IHM
+  try {
+    const cached = localStorage.getItem(CACHE_IHM);
+    if (cached) {
+      const { ts, extremes } = JSON.parse(cached);
+      if (Date.now() - ts < CACHE_TTL) {
+        processTideExtremes(extremes, 'IHM(caché)');
+        return true;
+      }
+    }
+  } catch(e) {}
+
+  // Pedir hoy + mañana para tener extremos completos
+  const today    = fmtDate(new Date());
+  const tomorrow = fmtDate(new Date(Date.now() + 86400000));
+
+  // allorigins devuelve { contents: "<json string>" }
+  const proxy = 'https://api.allorigins.win/get?url=';
+  const ihmBase = `http://ideihm.covam.es/api-ihm/getmarea?REQUEST=gettide&PORT=${IHM_PORT}&FORMAT=json`;
+
+  try {
+    const [r1, r2] = await Promise.all([
+      fetch(proxy + encodeURIComponent(ihmBase + `&DATE=${today}`),   { signal: AbortSignal.timeout(8000) }),
+      fetch(proxy + encodeURIComponent(ihmBase + `&DATE=${tomorrow}`),{ signal: AbortSignal.timeout(8000) }),
+    ]);
+
+    const [j1, j2] = await Promise.all([r1.json(), r2.json()]);
+    const d1 = JSON.parse(j1.contents);
+    const d2 = JSON.parse(j2.contents);
+
+    // La respuesta IHM tiene estructura: { data: [ { fecha, hora, altura, marea }, ... ] }
+    // "marea" puede ser "pleamar"/"bajamar" o "PM"/"BM"
+    const allData = [...(d1.data || []), ...(d2.data || [])];
+    const extremes = allData
+      .filter(e => e.marea)   // solo los registros con tipo de marea
+      .map(e => {
+        // Construir timestamp: fecha "DD/MM/YYYY" + hora "HH:MM"
+        const [d, m, y] = e.fecha.split('/');
+        const ts = new Date(`${y}-${m}-${d}T${e.hora}:00`).getTime();
+        const type = (e.marea.toLowerCase().includes('p') || e.marea === 'PM') ? 'High' : 'Low';
+        return { ts, type };
+      })
+      .filter(e => !isNaN(e.ts))
+      .sort((a, b) => a.ts - b.ts);
+
+    if (extremes.length < 2) {
+      console.warn('[IHM] datos insuficientes:', allData);
+      return false;
+    }
+
+    console.log('[IHM] extremos:', extremes.map(e =>
+      `${e.type} ${new Date(e.ts).toLocaleTimeString('es-ES',{hour:'2-digit',minute:'2-digit'})}`
+    ).join(' | '));
+
+    try {
+      localStorage.setItem(CACHE_IHM, JSON.stringify({ ts: Date.now(), extremes }));
+    } catch(ex) {}
+
+    processTideExtremes(extremes, 'IHM');
+    return true;
+
+  } catch(err) {
+    console.warn('[IHM] error:', err.message);
+    return false;
+  }
+}
+
+function fmtDate(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth()+1).padStart(2,'0');
+  const day = String(d.getDate()).padStart(2,'0');
+  return `${y}${m}${day}`;
+}
+
+// ── Fuente 2: Open-Meteo (fallback) ──────────────────
+// Si IHM falla, usamos Open-Meteo con interpolación cúbica de Hermite
+// para encontrar extremos con resolución de minutos, no horas.
+async function fetchTidesOpenMeteo() {
+  try {
+    const cached = localStorage.getItem(CACHE_OM);
+    if (cached) {
+      const { ts, extremes } = JSON.parse(cached);
+      if (Date.now() - ts < CACHE_TTL) {
+        processTideExtremes(extremes, 'OM(caché)');
+        return true;
+      }
+    }
+  } catch(e) {}
+
+  const url = `https://marine-api.open-meteo.com/v1/marine`
+    + `?latitude=${LAT}&longitude=${LON}`
+    + `&hourly=sea_level&timezone=Europe%2FMadrid&forecast_days=3`;
+
+  try {
+    const res  = await fetch(url, { signal: AbortSignal.timeout(10000) });
+    const data = await res.json();
+
+    if (!data.hourly?.sea_level) return false;
+
+    const times  = data.hourly.time;
+    const levels = data.hourly.sea_level;
+
+    // Interpolación cúbica de Hermite entre horas para encontrar
+    // el extremo real con precisión de ~1 minuto
+    const extremes = [];
+    for (let i = 1; i < levels.length - 2; i++) {
+      const p0 = levels[i-1], p1 = levels[i], p2 = levels[i+1], p3 = levels[i+2];
+      if (p0==null||p1==null||p2==null||p3==null) continue;
+
+      const isMax = p1 > p0 && p1 >= p2;
+      const isMin = p1 < p0 && p1 <= p2;
+      if (!isMax && !isMin) continue;
+
+      // Encontrar el mínimo/máximo real entre t=i y t=i+1 con interpolación
+      // Usamos spline cúbica de Catmull-Rom para suavizar
+      let bestT = 0, bestVal = p1;
+      for (let t = 0; t <= 60; t++) {  // 60 pasos = resolución de 1 minuto
+        const u = t / 60;
+        // Catmull-Rom
+        const v = 0.5 * (
+          (2*p1) +
+          (-p0 + p2)*u +
+          (2*p0 - 5*p1 + 4*p2 - p3)*u*u +
+          (-p0 + 3*p1 - 3*p2 + p3)*u*u*u
+        );
+        if (isMax && v > bestVal) { bestVal = v; bestT = t; }
+        if (isMin && v < bestVal) { bestVal = v; bestT = t; }
+      }
+
+      const t1ms = new Date(times[i]).getTime();
+      const ts   = t1ms + bestT * 60 * 1000;  // ajuste en minutos
+      extremes.push({ ts, type: isMax ? 'High' : 'Low' });
+    }
+
+    if (extremes.length < 2) return false;
+
+    console.log('[OM] extremos (interpolados):', extremes.slice(0,6).map(e =>
+      `${e.type} ${new Date(e.ts).toLocaleTimeString('es-ES',{hour:'2-digit',minute:'2-digit'})}`
+    ).join(' | '));
+
+    try {
+      localStorage.setItem(CACHE_OM, JSON.stringify({ ts: Date.now(), extremes }));
+    } catch(ex) {}
+
+    processTideExtremes(extremes, 'OM');
+    return true;
+
+  } catch(err) {
+    console.warn('[OM] error:', err.message);
+    return false;
+  }
+}
+
+// ── Fallback sinusoidal ───────────────────────────────
+function fallbackTide() {
+  const CYCLE  = 6 * 3600 * 1000 + 12.5 * 60 * 1000;
+  const ANCHOR = new Date('2024-01-01T06:00:00Z').getTime();
+  const phase  = ((Date.now() - ANCHOR) % CYCLE) / CYCLE;
+  tideData = { lastTs: Date.now() - phase*CYCLE, cycleTotal: CYCLE, rising: phase<0.5, source: 'fallback' };
+  console.warn('[mareas] fallback sinusoidal');
+  updateDebug();
+}
+
+// ── Orquestador: IHM → Open-Meteo → fallback ─────────
+async function fetchMarineData() {
+  const ihmOk = await fetchTidesIHM();
+  if (!ihmOk) {
+    console.warn('[mareas] IHM falló, probando Open-Meteo...');
+    const omOk = await fetchTidesOpenMeteo();
+    if (!omOk) fallbackTide();
+  }
+  fetchWaves();
+}
+
+// ── Procesador de extremos ────────────────────────────
+function processTideExtremes(extremes, source) {
+  const nowMs = Date.now();
+  extremes.sort((a, b) => a.ts - b.ts);
+  const past   = extremes.filter(e => e.ts <= nowMs);
+  const future = extremes.filter(e => e.ts >  nowMs);
+  if (!past.length || !future.length) { fallbackTide(); return; }
+
+  const last = past[past.length - 1];
+  const next = future[0];
+
+  tideData = {
+    lastTs:     last.ts,
+    cycleTotal: next.ts - last.ts,
+    rising:     next.type === 'High',
+    source:     source || '?'
+  };
+
+  const fmt = ts => new Date(ts).toLocaleTimeString('es-ES',{hour:'2-digit',minute:'2-digit'});
+  const lit = computeLitCount();
+  console.log(`[${source}] ${last.type}@${fmt(last.ts)} → ${next.type}@${fmt(next.ts)} | ${tideData.rising?'↑':'↓'} | lit=${lit}/64`);
+  updateDebug();
+}
+
+// ── Olas ──────────────────────────────────────────────
+async function fetchWaves() {
+  try {
+    const url  = `https://marine-api.open-meteo.com/v1/marine`
+      + `?latitude=${LAT}&longitude=${LON}`
+      + `&hourly=wave_height,wave_period&timezone=Europe%2FMadrid&forecast_days=1`;
+    const res  = await fetch(url);
+    const data = await res.json();
+    const hour = new Date().getHours();
+    const h = data.hourly.wave_height[hour];
+    const p = data.hourly.wave_period[hour];
+    if (h) waveHeightFt = h * 3.281;
+    if (p) wavePeriodMs = p * 1000;
+  } catch(e) {}
+}
+
+// ── Debug overlay (45 seg) ────────────────────────────
+let dbgVisible = true;
+setTimeout(() => { dbgVisible = false; dbgEl.textContent = ''; }, 45000);
+
+function updateDebug() {
+  if (!dbgVisible || !tideData) return;
+  const nowMs   = Date.now();
+  const elapsed = Math.round((nowMs - tideData.lastTs) / 60000);
+  const total   = Math.round(tideData.cycleTotal / 60000);
+  const frac    = ((nowMs - tideData.lastTs) / tideData.cycleTotal * 100).toFixed(1);
+  const lit     = computeLitCount();
+  const dir     = tideData.rising ? '↑ subiendo' : '↓ bajando';
+  const fmt     = ts => new Date(ts).toLocaleTimeString('es-ES',{hour:'2-digit',minute:'2-digit'});
+  dbgEl.innerHTML = `[${tideData.source}] ${dir} · lit=${lit}/64 · ${frac}% · ${elapsed}/${total}min`
+    + `<br>último: ${fmt(tideData.lastTs)} → próximo: ${fmt(tideData.lastTs + tideData.cycleTotal)}`;
+}
+setInterval(updateDebug, 5000);
+
+// ── Orden ola ─────────────────────────────────────────
+function buildScanOrder() {
+  const o = [];
+  for (let row=ROWS-1; row>=0; row--)
+    for (let col=0; col<COLS; col++) o.push(row*COLS+col);
+  return o;
+}
+const ORDER_UP   = buildScanOrder();
+const ORDER_DOWN = [...ORDER_UP].reverse();
+
+function lerp3(a, b, t) {
+  t = Math.max(0, Math.min(1, t));
+  return [Math.round(a[0]+(b[0]-a[0])*t), Math.round(a[1]+(b[1]-a[1])*t), Math.round(a[2]+(b[2]-a[2])*t)];
+}
+
+// ── Dibujar píxel Tidey ───────────────────────────────
+function drawPixel(row, col, color) {
+  const gridW = COLS*SIZE+(COLS-1)*GAP, gridH = ROWS*SIZE+(ROWS-1)*GAP+LIFT;
+  const ox=(W-gridW)/2, oy=(H-gridH)/2;
+  const x=ox+col*(SIZE+GAP), y=oy+row*(SIZE+GAP);
+  const [r,g,b]=color;
+  ctx.fillStyle=`rgb(${r},${g},${b})`; ctx.strokeStyle='rgba(0,0,0,0.4)'; ctx.lineWidth=1.5;
+  ctx.beginPath();
+  if (col%2===0) { ctx.moveTo(x,y+LIFT); ctx.lineTo(x+SIZE,y); ctx.lineTo(x+SIZE,y+SIZE); ctx.lineTo(x,y+SIZE+LIFT); }
+  else           { ctx.moveTo(x,y); ctx.lineTo(x+SIZE,y+LIFT); ctx.lineTo(x+SIZE,y+SIZE+LIFT); ctx.lineTo(x,y+SIZE); }
+  ctx.closePath(); ctx.fill(); ctx.stroke();
+}
+
+// ── Draw ──────────────────────────────────────────────
+function draw(litCount, rising, wavePos) {
+  ctx.clearRect(0, 0, W, H);
+  const litSet=new Set(ORDER_UP.slice(0,litCount));
+  const order=rising?ORDER_UP:ORDER_DOWN;
+  const headI=wavePos*(TOTAL-1);
+  const WAVE_LEN=Math.max(1,Math.min(8,Math.round(waveHeightFt)));
+  for (let row=0;row<ROWS;row++) {
+    for (let col=0;col<COLS;col++) {
+      const idx=row*COLS+col, isOn=litSet.has(idx);
+      const {on,off,flash:fc}=getColors(), base=isOn?on:off;
+      const waveI=order.indexOf(idx), dist=headI-waveI;
+      let flash=0;
+      if (dist>=0&&dist<=WAVE_LEN) flash=Math.pow(1-dist/WAVE_LEN,2);
+      const color=lerp3(base,fc,flash*0.95);
+      if (flash>0.1) { ctx.shadowColor=`rgba(200,240,255,${flash*0.5})`; ctx.shadowBlur=14*flash; }
+      else ctx.shadowBlur=0;
+      drawPixel(row,col,color);
+    }
+  }
+  ctx.shadowBlur=0;
+}
+
+// ── Fullscreen ────────────────────────────────────────
+function goFullscreen() {
+  const el=document.documentElement;
+  if (el.requestFullscreen) el.requestFullscreen();
+  else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+}
+document.addEventListener('click', goFullscreen);
+goFullscreen();
+
+// ── Service Workers ───────────────────────────────────
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.getRegistrations().then(regs=>regs.forEach(r=>r.unregister()));
+  caches.keys().then(keys=>keys.forEach(k=>caches.delete(k)));
+}
+
+// ── Visibilidad ───────────────────────────────────────
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  try {
+    const ihmCached = localStorage.getItem(CACHE_IHM);
+    if (!ihmCached || Date.now() - JSON.parse(ihmCached).ts > CACHE_TTL) {
+      fetchMarineData();
+    }
+    // Si la caché es válida, computeLitCount() ya usa Date.now() — no hace falta nada más
+  } catch(e) { fetchMarineData(); }
+});
+
+// ── Loop ──────────────────────────────────────────────
+fetchMarineData();
+setInterval(fetchMarineData, 60 * 60 * 1000);
+
+function loop(ts) {
+  const wavePos  = (ts % wavePeriodMs) / wavePeriodMs;
+  const litCount = computeLitCount();
+  const rising   = tideData ? tideData.rising : true;
+  draw(litCount, rising, wavePos);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
